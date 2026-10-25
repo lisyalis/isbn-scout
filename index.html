@@ -216,6 +216,7 @@ const LS = {
 };
 const DEFAULT_TRIGGERS = [
   {name:"Fast Mover",        on:true, color:"green",  rMin:1,       rMax:250000,   pMin:24, pMax:9999, minProfit:4},
+  {name:"Slow Mover",        on:true, color:"green",  rMin:1,       rMax:250000,   pMin:6,  pMax:23,   minProfit:7},
   {name:"Good Mover",        on:true, color:"green",  rMin:250000,  rMax:1000000,  pMin:24, pMax:9999, minProfit:5},
   {name:"Solid Buy",         on:true, color:"green",  rMin:1000000, rMax:3000000,  pMin:12, pMax:9999, minProfit:7},
   {name:"Lowest Price Check",on:true, color:"yellow", rMin:1000000, rMax:3000000,  pMin:6,  pMax:9999, minProfit:7},
@@ -242,14 +243,24 @@ const S = {
   defCost:  LS.get("defCost", 0.00),
   buybox:   LS.get("buybox", true),        // costs +2 Keepa tokens
   autoOffers: LS.get("autoOffers", false),
-  cont:     LS.get("cont", false),         // continuous scan // live offers cost ~12 tokens per scan
+  cont:     LS.get("cont", false),         // continuous scan
+  ladder:   LS.get("ladder", true),        // triggers fall through to slower tiers
+  roi:      LS.get("roi", {minProfit:5, minRoi:50, maxRank:6000000, minPulse:6}), // live offers cost ~12 tokens per scan
   history:  LS.get("history", []),
   inv:      LS.get("inv", []),
   tokens:   LS.get("tokens", null)
 };
 // pulse max of 186 (from the old app) cut off the fastest sellers; treat it as no upper limit
 S.triggers.forEach(t => { if (t.pMax === 186) t.pMax = 9999; });
-function save(){ for (const k of ["key","mode","cond","triggers","ev","inbound","prep","defCost","buybox","autoOffers","cont","history","inv","tokens"]) LS.set(k, S[k]); }
+// add the Slow Mover trigger to saved settings once, right after Fast Mover
+if (!LS.get("addedSlow", false)){
+  if (!S.triggers.some(t => t.name === "Slow Mover")){
+    const i = S.triggers.findIndex(t => t.name === "Fast Mover");
+    S.triggers.splice(i >= 0 ? i+1 : 0, 0, {name:"Slow Mover",on:true,color:"green",rMin:1,rMax:250000,pMin:6,pMax:23,minProfit:7});
+  }
+  LS.set("addedSlow", true); LS.set("triggers", S.triggers);
+}
+function save(){ for (const k of ["key","mode","cond","triggers","ev","inbound","prep","defCost","buybox","autoOffers","cont","ladder","roi","history","inv","tokens"]) LS.set(k, S[k]); }
 
 /* ============ helpers ============ */
 const $ = s => document.querySelector(s);
@@ -497,15 +508,20 @@ function calc(p, cost){
   const res = {pr, sell, sellSrc, fees, profit, fbaFee, refPct, closing, lbs, isBook, buy:false, why:"", trigger:null};
   if (profit == null){ res.why = "No price"; return res; }
   if (p.isAdultProduct){ res.why = "Adult item"; return res; }
+  res.roi = cost > 0 ? res.profit / cost * 100 : null;
   if (S.mode === "ev") return evDecide(res);
+  if (S.mode === "roi") return roiDecide(res);
   return trigDecide(res);
 }
 function trigDecide(res){
   const rank = res.pr.rank ?? 0, pulse = res.pr.pulse;
   for (const t of S.triggers){
     if (!t.on) continue;
-    const inRank = rank >= t.rMin && rank <= t.rMax;
-    const inPulse = pulse >= t.pMin && pulse <= t.pMax;
+    // Ladder: a better rank or a faster pulse never disqualifies a book. If it misses a tier,
+    // it drops to the next, slower tier, which asks for more profit. Exclude (red) triggers still use exact ranges.
+    const ladder = S.ladder && t.color !== "red";
+    const inRank = ladder ? (rank > 0 && rank <= t.rMax) : (rank >= t.rMin && rank <= t.rMax);
+    const inPulse = ladder ? pulse >= t.pMin : (pulse >= t.pMin && pulse <= t.pMax);
     if (inRank && inPulse){
       res.trigger = t.name;
       if (t.color === "red"){ res.why = t.name; return res; }
@@ -514,6 +530,17 @@ function trigDecide(res){
     }
   }
   res.why = res.trigger ? "Under min profit" : "No trigger hit";
+  return res;
+}
+function roiDecide(res){
+  const r = S.roi, rank = res.pr.rank, pulse = res.pr.pulse;
+  res.target = r.minProfit; res.trigger = "ROI rule";
+  if (!rank || rank > r.maxRank){ res.why = rank ? "Rank over " + kfmt(r.maxRank) : "No sales rank"; return res; }
+  if (pulse < r.minPulse){ res.why = `Only ${pulse} sales in 6m (need ${r.minPulse})`; return res; }
+  if (res.profit < r.minProfit){ res.why = "Under $" + r.minProfit + " profit"; return res; }
+  if (res.roi != null && res.roi < r.minRoi){ res.why = `ROI ${Math.round(res.roi)}% (need ${r.minRoi}%)`; return res; }
+  res.buy = true;
+  res.why = "ROI rule · " + (res.roi == null ? "free item" : Math.round(res.roi) + "% ROI");
   return res;
 }
 function bucket(pr){
@@ -583,6 +610,7 @@ function renderScanInner(err){
     <div class="seg" role="group" aria-label="Decision mode">
       <button data-mode="triggers" aria-pressed="${S.mode==="triggers"}">TRIG</button>
       <button data-mode="ev" aria-pressed="${S.mode==="ev"}">EV</button>
+      <button data-mode="roi" aria-pressed="${S.mode==="roi"}">ROI</button>
     </div>
     <span class="tokens num" title="Keepa tokens left">${S.tokens==null ? "— tok" : kfmt(S.tokens)+" tok"}</span>
   </div>`;
@@ -610,7 +638,7 @@ function resultHTML(){
   ${rangeHTML()}
   ${tilesHTML()}
   ${offersHTML()}
-  <div class="note" style="margin-top:6px">Fees ${money(c.fees)} = ${Math.round(c.refPct*100)}% referral${c.closing?" + $1.80 closing":""} + ${money(c.fbaFee)} FBA + ${money(c.lbs*S.inbound)} inbound${S.prep?" + prep":""} · offers: ${pr.countUsed} used / ${pr.countNew} new</div>
+  <div class="note" style="margin-top:6px">${c.roi != null ? `ROI ${Math.round(c.roi)}% · ` : ""}Fees ${money(c.fees)} = ${Math.round(c.refPct*100)}% referral${c.closing?" + $1.80 closing":""} + ${money(c.fbaFee)} FBA + ${money(c.lbs*S.inbound)} inbound${S.prep?" + prep":""} · offers: ${pr.countUsed} used / ${pr.countNew} new</div>
   <div class="links">
     <button class="chip acc" id="chartBtn">Chart</button>
     <a class="chip" target="_blank" rel="noopener" href="https://www.amazon.com/dp/${p.asin}">Amazon</a>
@@ -958,8 +986,17 @@ function renderSettings(){
       <label>Default buy cost $<input id="dc" inputmode="decimal" value="${S.defCost}"></label>
     </div>
   </div>
-  <div class="row" style="margin:14px 0 6px"><h2 class="grow" style="margin:0">FBA triggers</h2><span class="note">${S.mode==="triggers"?"Active":"Off (EV mode)"}</span></div>
-  <div class="note" style="margin-bottom:8px">Checked top to bottom. First trigger whose rank and pulse match decides. Red = always skip.</div>
+  <div class="row" style="margin:14px 0 6px"><h2 class="grow" style="margin:0">ROI rule</h2><span class="note">${S.mode==="roi"?"Active":"Tap ROI on the scanner to use"}</span></div>
+  <div class="card trig"><div class="note">BUY when every one of these is true.</div>
+    <div class="trig-grid">
+      <label>Min profit $<input inputmode="decimal" data-roi="minProfit" value="${S.roi.minProfit}"></label>
+      <label>Min ROI %<input inputmode="decimal" data-roi="minRoi" value="${S.roi.minRoi}"></label>
+      <label>Max sales rank<input inputmode="numeric" data-roi="maxRank" value="${S.roi.maxRank}"></label>
+      <label>Min sales in 6 months<input inputmode="numeric" data-roi="minPulse" value="${S.roi.minPulse}"></label>
+    </div></div>
+  <div class="row" style="margin:14px 0 6px"><h2 class="grow" style="margin:0">FBA triggers</h2><span class="note">${S.mode==="triggers"?"Active":"Off"}</span></div>
+  <div class="row card" style="margin-bottom:8px"><span class="grow"><b>Ladder mode</b><br><span class="note">On: a book that misses a tier drops to the next slower tier, which needs more profit. Off: a book must fit a trigger's exact rank and pulse box.</span></span><label class="switch"><input type="checkbox" id="lad" ${S.ladder?"checked":""}><span></span></label></div>
+  <div class="note" style="margin-bottom:8px">Checked top to bottom, so keep the fastest tiers first. Red = always skip.</div>
   <div id="trigs">${S.triggers.map((t,i)=>`<div class="card trig ${t.color==="green"?"":t.color}">
     <div class="row"><input class="grow" data-f="name" data-i="${i}" value="${esc(t.name)}" style="font-weight:700">
       <label class="switch"><input type="checkbox" data-f="on" data-i="${i}" ${t.on?"checked":""}><span></span></label></div>
@@ -973,7 +1010,7 @@ function renderSettings(){
   </div>`).join("")}</div>
   <div class="row" style="gap:8px"><button class="btn" id="addT" style="flex:1">Add trigger</button><button class="btn" id="resetT" style="flex:1">Reset to defaults</button></div>
 
-  <div class="row" style="margin:18px 0 6px"><h2 class="grow" style="margin:0">How often it sells</h2><span class="note">${S.mode==="ev"?"Active":"Off (trigger mode)"}</span></div>
+  <div class="row" style="margin:18px 0 6px"><h2 class="grow" style="margin:0">How often it sells</h2><span class="note">${S.mode==="ev"?"Active":"Off"}</span></div>
   <div class="note" style="margin-bottom:8px">Expected = profit × share sold within 6 months. BUY when expected is at least the amount in its row. Leave blank to pass on that speed.</div>
   <div class="card" style="overflow-x:auto"><table class="ev"><tr><td></td><td class="label" style="text-align:center">% sold 6m</td><td class="label" style="text-align:center">Keep $</td></tr>
   ${S.ev.map((r,i)=>`<tr><td>${r.label}<small>${r.sub}</small></td>
@@ -984,6 +1021,8 @@ function renderSettings(){
   $("#key").onchange = e => { S.key = e.target.value.trim(); save(); toast("Key saved"); };
   $("#bb").onchange = e => { S.buybox = e.target.checked; save(); };
   $("#ao").onchange = e => { S.autoOffers = e.target.checked; save(); };
+  $("#lad").onchange = e => { S.ladder = e.target.checked; save(); };
+  document.querySelectorAll("[data-roi]").forEach(el => el.onchange = () => { S.roi[el.dataset.roi] = num(el); save(); });
   $("#tokBtn").onclick = async () => { $("#tokOut").textContent = "Checking…"; const t = await keepaTokens(); $("#tokOut").textContent = t && t.tokensLeft!=null ? `${t.tokensLeft} left · refills ${t.refillRate}/min` + (t.refillIn ? ` · next in ${Math.ceil(t.refillIn/1000)}s` : "") : (t && t.error ? (t.error.message||"Key rejected") : "Couldn't reach Keepa"); };
   $("#inb").onchange = e => { S.inbound = num(e.target, .4); save(); };
   $("#prep").onchange = e => { S.prep = num(e.target); save(); };
