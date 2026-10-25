@@ -215,11 +215,11 @@ const LS = {
   set(k, v){ try{ localStorage.setItem("scout."+k, JSON.stringify(v)); }catch(e){} }
 };
 const DEFAULT_TRIGGERS = [
-  {name:"Fast Mover",        on:true, color:"green",  rMin:1,       rMax:250000,   pMin:24, pMax:186, minProfit:4},
-  {name:"Good Mover",        on:true, color:"green",  rMin:250000,  rMax:1000000,  pMin:24, pMax:186, minProfit:5},
-  {name:"Solid Buy",         on:true, color:"green",  rMin:1000000, rMax:3000000,  pMin:12, pMax:186, minProfit:7},
-  {name:"Lowest Price Check",on:true, color:"yellow", rMin:1000000, rMax:3000000,  pMin:6,  pMax:186, minProfit:7},
-  {name:"Lowest Price Check",on:true, color:"yellow", rMin:3000000, rMax:6000000,  pMin:3,  pMax:186, minProfit:20},
+  {name:"Fast Mover",        on:true, color:"green",  rMin:1,       rMax:250000,   pMin:24, pMax:9999, minProfit:4},
+  {name:"Good Mover",        on:true, color:"green",  rMin:250000,  rMax:1000000,  pMin:24, pMax:9999, minProfit:5},
+  {name:"Solid Buy",         on:true, color:"green",  rMin:1000000, rMax:3000000,  pMin:12, pMax:9999, minProfit:7},
+  {name:"Lowest Price Check",on:true, color:"yellow", rMin:1000000, rMax:3000000,  pMin:6,  pMax:9999, minProfit:7},
+  {name:"Lowest Price Check",on:true, color:"yellow", rMin:3000000, rMax:6000000,  pMin:3,  pMax:9999, minProfit:20},
   {name:"Exclude Trigger",   on:true, color:"red",    rMin:6000000, rMax:100000000,pMin:100,pMax:101, minProfit:10000}
 ];
 const DEFAULT_EV = [
@@ -247,6 +247,8 @@ const S = {
   inv:      LS.get("inv", []),
   tokens:   LS.get("tokens", null)
 };
+// pulse max of 186 (from the old app) cut off the fastest sellers; treat it as no upper limit
+S.triggers.forEach(t => { if (t.pMax === 186) t.pMax = 9999; });
 function save(){ for (const k of ["key","mode","cond","triggers","ev","inbound","prep","defCost","buybox","autoOffers","cont","history","inv","tokens"]) LS.set(k, S[k]); }
 
 /* ============ helpers ============ */
@@ -469,15 +471,19 @@ function readPrices(p){
 }
 function calc(p, cost){
   const pr = readPrices(p);
-  let sell = S.cond === "used"
-    ? (pr.usedBB ?? pr.usedVG ?? pr.usedG ?? pr.usedLow)
-    : (pr.newBB ?? pr.newFBA ?? pr.newLow ?? pr.amazon);
-  let sellSrc = "buy box";
+  const firstOf = list => { for (const [v, src] of list) if (v != null) return [v, src]; return [null, ""]; };
+  let [sell, sellSrc] = S.cond === "used"
+    ? firstOf([[pr.usedBB,"used buy box"],[pr.usedVG,"lowest VG"],[pr.usedG,"lowest G"],[pr.usedLow,"lowest used"]])
+    : firstOf([[pr.newBB,"new buy box"],[pr.newFBA,"lowest new FBA"],[pr.newLow,"lowest new"],[pr.amazon,"Amazon"]]);
   const offs = current && current.product === p ? current.offers : null;
+  let newFBA = pr.newFBA ?? pr.newBB;
   if (offs){
     const fba = offs.filter(x => x.fba && (S.cond === "used" ? x.used : x.isNew));
     if (fba.length){ sell = fba[0].total; sellSrc = "lowest FBA"; }
+    const nf = offs.find(x => x.fba && x.isNew); if (nf) newFBA = nf.total;
   }
+  // buyers won't pay more for used than for a new Prime copy
+  if (S.cond === "used" && sell != null && newFBA != null && newFBA < sell){ sell = newFBA; sellSrc = "capped at new FBA"; }
   const isBook = p.rootCategory === 283155 || p.productGroup === "Book" || p.type === "BOOK";
   const refPct = (p.referralFeePercentage ?? p.referralFeePercent ?? 15) / 100;
   const fbaFee = p.fbaFees && p.fbaFees.pickAndPackFee > 0 ? p.fbaFees.pickAndPackFee/100 : 3.50;
@@ -994,7 +1000,7 @@ function renderSettings(){
   });
   document.querySelectorAll("[data-up]").forEach(b => b.onclick = () => { const i=+b.dataset.up; if(i>0){ [S.triggers[i-1],S.triggers[i]]=[S.triggers[i],S.triggers[i-1]]; save(); renderSettings(); } });
   document.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => { if (b.dataset.sure){ S.triggers.splice(+b.dataset.rm,1); save(); renderSettings(); } else { b.dataset.sure="1"; b.textContent="Tap again"; } });
-  $("#addT").onclick = () => { S.triggers.push({name:"New trigger",on:true,color:"green",rMin:1,rMax:500000,pMin:1,pMax:186,minProfit:5}); save(); renderSettings(); };
+  $("#addT").onclick = () => { S.triggers.push({name:"New trigger",on:true,color:"green",rMin:1,rMax:500000,pMin:1,pMax:9999,minProfit:5}); save(); renderSettings(); };
   $("#resetT").onclick = e => { const b=e.target; if (b.dataset.sure){ S.triggers=JSON.parse(JSON.stringify(DEFAULT_TRIGGERS)); S.ev=JSON.parse(JSON.stringify(DEFAULT_EV)); save(); renderSettings(); } else { b.dataset.sure="1"; b.textContent="Tap again to reset"; } };
 }
 
